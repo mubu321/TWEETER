@@ -1,0 +1,1102 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>ViewTube</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp }   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, addDoc, doc, deleteDoc,
+  onSnapshot, query, orderBy, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getStorage, ref, uploadBytesResumable, getDownloadURL, deleteObject }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+
+// ========== FIREBASE CONFIG ==========
+const firebaseConfig = {
+  apiKey:            "YOUR_API_KEY",
+  authDomain:        "YOUR_AUTH_DOMAIN",
+  projectId:         "YOUR_PROJECT_ID",
+  storageBucket:     "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId:             "YOUR_APP_ID"
+};
+// =====================================
+
+let currentUser=null, auth, db, storage;
+let isDemo=false, currentVideo=null, allVideos=[];
+
+try {
+  const app=initializeApp(firebaseConfig);
+  auth=getAuth(app); db=getFirestore(app); storage=getStorage(app);
+  onAuthStateChanged(auth,user=>{ currentUser=user; updateAuthUI(user); });
+  loadVideos();
+} catch(e) {
+  isDemo=true;
+  document.getElementById("demo-banner").style.display="flex";
+  initDemoMode();
+}
+
+// AUTH
+window.handleLogin=async()=>{
+  if(isDemo){enterDemoUser();return;}
+  try{await signInWithPopup(auth,new GoogleAuthProvider());}
+  catch(e){if(e.code!=="auth/popup-closed-by-user")alert("ログイン失敗: "+e.message);}
+};
+window.handleLogout=async()=>{
+  if(isDemo){exitDemoUser();return;}
+  await signOut(auth);
+};
+
+function updateAuthUI(user){
+  const li=document.getElementById("auth-in");
+  const lo=document.getElementById("auth-out");
+  const ub=document.getElementById("upload-btn-wrap");
+  if(user){
+    lo.style.display="none"; li.style.display="flex"; ub.style.display="flex";
+    const init=(user.displayName||"?")[0].toUpperCase();
+    document.getElementById("hdr-avatar").innerHTML=user.photoURL
+      ?`<img src="${user.photoURL}" class="hdr-av-img" alt="">`
+      :`<div class="hdr-av-init">${init}</div>`;
+  }else{
+    lo.style.display="flex"; li.style.display="none"; ub.style.display="none";
+  }
+}
+
+// SIDEBAR TOGGLE
+let sidebarCollapsed=false;
+window.toggleSidebar=()=>{
+  sidebarCollapsed=!sidebarCollapsed;
+  document.getElementById("sidebar").classList.toggle("collapsed",sidebarCollapsed);
+  document.getElementById("main-content").classList.toggle("sidebar-collapsed",sidebarCollapsed);
+};
+
+// UPLOAD
+const dropzone=document.getElementById("dropzone");
+const fileInp=document.getElementById("file-input");
+const thumbInp=document.getElementById("thumb-input");
+let selVid=null,selThumb=null;
+
+dropzone.addEventListener("click",()=>fileInp.click());
+dropzone.addEventListener("dragover",e=>{e.preventDefault();dropzone.classList.add("dz-over");});
+dropzone.addEventListener("dragleave",()=>dropzone.classList.remove("dz-over"));
+dropzone.addEventListener("drop",e=>{
+  e.preventDefault();dropzone.classList.remove("dz-over");
+  const f=e.dataTransfer.files[0];
+  if(f&&f.type.startsWith("video/"))setVideoFile(f);
+  else showToast("動画ファイルを選んでください","error");
+});
+fileInp.addEventListener("change",e=>{if(e.target.files[0])setVideoFile(e.target.files[0]);});
+thumbInp.addEventListener("change",e=>{
+  const f=e.target.files[0];if(!f)return;
+  selThumb=f;
+  document.getElementById("thumb-preview").src=URL.createObjectURL(f);
+  document.getElementById("thumb-preview-wrap").style.display="block";
+});
+
+function setVideoFile(file){
+  selVid=file;
+  const mb=(file.size/1024/1024).toFixed(1);
+  document.getElementById("dz-icon").textContent="🎬";
+  document.getElementById("dz-text").innerHTML=`<strong>${esc(file.name)}</strong><span>${mb} MB</span>`;
+  document.getElementById("upload-fields").style.display="block";
+  genThumb(file);
+}
+function genThumb(file){
+  const v=document.createElement("video");
+  v.src=URL.createObjectURL(file);v.currentTime=1;v.muted=true;
+  v.addEventListener("seeked",()=>{
+    const c=document.createElement("canvas");
+    c.width=v.videoWidth||640;c.height=v.videoHeight||360;
+    c.getContext("2d").drawImage(v,0,0);
+    c.toBlob(b=>{
+      if(!b)return;
+      selThumb=new File([b],"thumb.jpg",{type:"image/jpeg"});
+      document.getElementById("thumb-preview").src=URL.createObjectURL(b);
+      document.getElementById("thumb-preview-wrap").style.display="block";
+    },"image/jpeg",0.85);
+    URL.revokeObjectURL(v.src);
+  });v.load();
+}
+document.getElementById("thumb-area").addEventListener("click",()=>thumbInp.click());
+document.getElementById("submit-upload").addEventListener("click",async()=>{
+  if(!currentUser){openLoginModal();return;}
+  const title=document.getElementById("up-title").value.trim();
+  const desc=document.getElementById("up-desc").value.trim();
+  if(!selVid){showToast("動画を選んでください","error");return;}
+  if(!title){showToast("タイトルを入力してください","error");return;}
+  if(isDemo){
+    addDemoVideo({title,desc,videoUrl:URL.createObjectURL(selVid),
+      thumbUrl:selThumb?URL.createObjectURL(selThumb):""});
+    resetUpload();showPage("home");showToast("✓ 投稿しました！");return;
+  }
+  const btn=document.getElementById("submit-upload");
+  btn.disabled=true;
+  const pw=document.getElementById("prog-wrap");
+  const pb=document.getElementById("prog-bar");
+  const pp=document.getElementById("prog-pct");
+  pw.style.display="block";
+  try{
+    const uid=currentUser.uid,ts=Date.now();
+    const vr=ref(storage,`videos/${uid}/${ts}_${selVid.name}`);
+    const tk=uploadBytesResumable(vr,selVid);
+    tk.on("state_changed",
+      s=>{const p=Math.round(s.bytesTransferred/s.totalBytes*90);pb.style.width=p+"%";pp.textContent=p+"%";},
+      er=>{showToast("失敗: "+er.message,"error");btn.disabled=false;pw.style.display="none";},
+      async()=>{
+        const videoUrl=await getDownloadURL(tk.snapshot.ref);
+        let thumbUrl="";
+        if(selThumb){
+          const tr=ref(storage,`thumbs/${uid}/${ts}_thumb.jpg`);
+          const tt=uploadBytesResumable(tr,selThumb);
+          await new Promise((r,j)=>tt.on("state_changed",null,j,r));
+          thumbUrl=await getDownloadURL(tt.snapshot.ref);
+        }
+        pb.style.width="100%";pp.textContent="100%";
+        await addDoc(collection(db,"videos"),{
+          title,desc,videoUrl,thumbUrl,fileName:selVid.name,uid,
+          displayName:currentUser.displayName||"ユーザー",
+          photoURL:currentUser.photoURL||"",createdAt:serverTimestamp()
+        });
+        resetUpload();showPage("home");showToast("✓ 投稿しました！");
+        btn.disabled=false;pw.style.display="none";
+      }
+    );
+  }catch(e){showToast("エラー: "+e.message,"error");btn.disabled=false;pw.style.display="none";}
+});
+function resetUpload(){
+  selVid=null;selThumb=null;fileInp.value="";thumbInp.value="";
+  document.getElementById("dz-icon").textContent="📁";
+  document.getElementById("dz-text").innerHTML="動画をドラッグ＆ドロップ<span>またはクリックして選択</span>";
+  document.getElementById("upload-fields").style.display="none";
+  document.getElementById("up-title").value="";
+  document.getElementById("up-desc").value="";
+  document.getElementById("thumb-preview-wrap").style.display="none";
+  document.getElementById("prog-wrap").style.display="none";
+  document.getElementById("prog-bar").style.width="0%";
+}
+
+// PAGES
+window.showPage=p=>{
+  document.querySelectorAll(".page").forEach(el=>el.style.display="none");
+  document.getElementById("page-"+p).style.display="block";
+  if(p!=="player"){const v=document.getElementById("main-video");v.pause();v.src="";}
+  window.scrollTo(0,0);
+  // update active nav
+  document.querySelectorAll(".nav-item").forEach(el=>el.classList.remove("active"));
+  if(p==="home")document.getElementById("nav-home").classList.add("active");
+  if(p==="upload")document.getElementById("nav-upload").classList.add("active");
+};
+window.goHome=()=>showPage("home");
+window.openUpload=()=>{if(!currentUser){openLoginModal();return;}showPage("upload");};
+
+// LOAD VIDEOS
+function loadVideos(sq=""){
+  const grid=document.getElementById("video-grid");
+  grid.innerHTML=`<div class="grid-skel">${Array(12).fill("").map(()=>`
+    <div class="skel"><div class="skel-th"></div><div class="skel-av-row"><div class="skel-av"></div><div class="skel-lines"><div class="skel-line" style="width:85%"></div><div class="skel-line" style="width:55%"></div></div></div></div>`).join("")}</div>`;
+  if(isDemo){renderGrid(demoVideos,sq);return;}
+  const q=query(collection(db,"videos"),orderBy("createdAt","desc"));
+  onSnapshot(q,snap=>{
+    allVideos=snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderGrid(allVideos,sq);
+  },err=>grid.innerHTML=`<div class="empty"><p>読み込みエラー: ${err.message}</p></div>`);
+}
+function renderGrid(videos,sq=""){
+  if(sq){const s=sq.toLowerCase();videos=videos.filter(v=>v.title?.toLowerCase().includes(s)||v.displayName?.toLowerCase().includes(s));}
+  const grid=document.getElementById("video-grid");
+  if(!videos.length){
+    grid.innerHTML=`<div class="empty"><div style="font-size:56px;margin-bottom:16px">📺</div>
+      <h3>${sq?"「"+esc(sq)+"」の動画は見つかりません":"まだ動画がありません"}</h3>
+      <p>${sq?"別のキーワードで試してみてください":"最初の動画を投稿しましょう！"}</p></div>`;
+    return;
+  }
+  grid.innerHTML="";
+  videos.forEach(v=>{
+    const card=document.createElement("div");
+    card.className="yt-card";
+    const time=v.createdAt?.toDate?fmtTime(v.createdAt.toDate()):"今";
+    const init=(v.displayName||"?")[0].toUpperCase();
+    card.innerHTML=`
+      <div class="yt-thumb">
+        ${v.thumbUrl?`<img src="${v.thumbUrl}" alt="${esc(v.title)}" loading="lazy">`:`<div class="no-thumb"></div>`}
+        <div class="yt-dur"></div>
+      </div>
+      <div class="yt-info">
+        <div class="yt-ch-av">
+          ${v.photoURL?`<img src="${v.photoURL}" class="ch-img" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`:``}
+          <div class="ch-init" style="${v.photoURL?"display:none":"display:flex"}">${init}</div>
+        </div>
+        <div class="yt-meta">
+          <h3 class="yt-title">${esc(v.title)}</h3>
+          <div class="yt-ch-name">${esc(v.displayName)}</div>
+          <div class="yt-stats">${time}</div>
+        </div>
+        <div class="yt-more-btn" data-id="${v.id}">
+          <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 16.5c.83 0 1.5.67 1.5 1.5s-.67 1.5-1.5 1.5-1.5-.67-1.5-1.5.67-1.5 1.5-1.5zm0-6c.83 0 1.5.67 1.5 1.5S12.83 13.5 12 13.5 10.5 12.83 10.5 12s.67-1.5 1.5-1.5zm0-6c.83 0 1.5.67 1.5 1.5S12.83 7.5 12 7.5 10.5 6.83 10.5 6s.67-1.5 1.5-1.5z"/></svg>
+        </div>
+      </div>`;
+    card.querySelector(".yt-thumb").addEventListener("click",()=>openPlayer(v));
+    card.querySelector(".yt-title").addEventListener("click",()=>openPlayer(v));
+    card.querySelector(".yt-more-btn").addEventListener("click",e=>{
+      e.stopPropagation();showCardMenu(e.currentTarget,v);
+    });
+    grid.appendChild(card);
+  });
+}
+
+// CARD CONTEXT MENU
+function showCardMenu(btn,video){
+  document.querySelectorAll(".ctx-menu").forEach(m=>m.remove());
+  const menu=document.createElement("div");
+  menu.className="ctx-menu";
+  const isOwner=video.uid===currentUser?.uid;
+  menu.innerHTML=`${isOwner?`<button class="ctx-item ctx-delete" data-id="${video.id}"><svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>削除</button>`:""}
+    <button class="ctx-item"><svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>リンクをコピー</button>`;
+  const rect=btn.getBoundingClientRect();
+  menu.style.cssText=`position:fixed;top:${rect.bottom+4}px;right:${window.innerWidth-rect.right}px;z-index:9999;`;
+  document.body.appendChild(menu);
+  menu.querySelector(".ctx-delete")?.addEventListener("click",()=>{menu.remove();deleteVideo(video);});
+  menu.querySelector(".ctx-item:last-child")?.addEventListener("click",()=>{
+    navigator.clipboard?.writeText(location.href+"#"+video.id).catch(()=>{});
+    menu.remove(); showToast("リンクをコピーしました");
+  });
+  setTimeout(()=>document.addEventListener("click",()=>menu.remove(),{once:true}),50);
+}
+
+// PLAYER
+function openPlayer(video){
+  currentVideo=video;showPage("player");
+  const vEl=document.getElementById("main-video");
+  vEl.src=video.videoUrl;vEl.load();vEl.play().catch(()=>{});
+  document.getElementById("pl-title").textContent=video.title;
+  const time=video.createdAt?.toDate?fmtTime(video.createdAt.toDate()):"今";
+  const init=(video.displayName||"?")[0].toUpperCase();
+  document.getElementById("pl-ch-av").innerHTML=video.photoURL
+    ?`<img src="${video.photoURL}" class="pl-ch-img" alt="">`
+    :`<div class="pl-ch-init">${init}</div>`;
+  document.getElementById("pl-ch-name").textContent=video.displayName;
+  document.getElementById("pl-time").textContent=time;
+  document.getElementById("pl-desc").textContent=video.desc||"";
+  const delBtn=document.getElementById("pl-delete");
+  delBtn.style.display=video.uid===currentUser?.uid?"inline-flex":"none";
+  delBtn.onclick=()=>deleteVideo(video);
+  // related
+  const rel=document.getElementById("related-list");rel.innerHTML="";
+  (isDemo?demoVideos:allVideos).filter(v=>v.id!==video.id).slice(0,15).forEach(v=>{
+    const d=document.createElement("div");d.className="rel-item";
+    const ri=(v.displayName||"?")[0].toUpperCase();
+    d.innerHTML=`
+      <div class="rel-thumb">${v.thumbUrl?`<img src="${v.thumbUrl}" loading="lazy" alt="">`:``}</div>
+      <div class="rel-meta">
+        <div class="rel-title">${esc(v.title)}</div>
+        <div class="rel-ch">${esc(v.displayName)}</div>
+        <div class="rel-time">${v.createdAt?.toDate?fmtTime(v.createdAt.toDate()):"今"}</div>
+      </div>`;
+    d.addEventListener("click",()=>openPlayer(v));
+    rel.appendChild(d);
+  });
+}
+async function deleteVideo(video){
+  if(!confirm("この動画を削除しますか？"))return;
+  if(isDemo){
+    const i=demoVideos.findIndex(v=>v.id===video.id);if(i>-1)demoVideos.splice(i,1);
+    goHome();renderGrid(demoVideos);return;
+  }
+  try{
+    await deleteDoc(doc(db,"videos",video.id));
+    if(video.videoUrl)try{await deleteObject(ref(storage,video.videoUrl));}catch{}
+    if(video.thumbUrl)try{await deleteObject(ref(storage,video.thumbUrl));}catch{}
+    goHome();showToast("削除しました");
+  }catch(e){showToast("削除失敗: "+e.message,"error");}
+}
+
+// LIKE
+let likedSet=new Set();
+document.getElementById("pl-like").addEventListener("click",()=>{
+  if(!currentUser){openLoginModal();return;}
+  const id=currentVideo?.id;if(!id)return;
+  const btn=document.getElementById("pl-like");
+  const cnt=document.getElementById("pl-like-cnt");
+  if(likedSet.has(id)){likedSet.delete(id);btn.classList.remove("liked");cnt.textContent=Math.max(0,(parseInt(cnt.textContent)||0)-1)||"";}
+  else{likedSet.add(id);btn.classList.add("liked");cnt.textContent=(parseInt(cnt.textContent)||0)+1;}
+});
+
+// SEARCH
+let sTimer;
+document.getElementById("search-input").addEventListener("input",function(){
+  clearTimeout(sTimer);const q=this.value.trim();
+  sTimer=setTimeout(()=>{
+    if(document.getElementById("page-home").style.display!=="none"){
+      if(isDemo)renderGrid(demoVideos,q);else loadVideos(q);
+    }
+  },280);
+});
+document.getElementById("search-form").addEventListener("submit",e=>{
+  e.preventDefault();
+  const q=document.getElementById("search-input").value.trim();
+  showPage("home");
+  if(isDemo)renderGrid(demoVideos,q);else loadVideos(q);
+});
+
+// LOGIN MODAL
+function openLoginModal(){document.getElementById("login-modal").style.display="flex";}
+window.closeLoginModal=()=>{document.getElementById("login-modal").style.display="none";};
+
+// TOAST
+function showToast(msg,type=""){
+  const t=document.createElement("div");
+  t.className="yt-toast"+(type==="error"?" err":"");
+  t.textContent=msg;document.body.appendChild(t);
+  requestAnimationFrame(()=>t.classList.add("show"));
+  setTimeout(()=>{t.classList.remove("show");setTimeout(()=>t.remove(),300);},3000);
+}
+window.showToast=showToast;
+
+// DEMO
+let demoVideos=[
+  {id:"d1",title:"夕暮れの公園散歩 — 秋の風景",desc:"近所の公園を夕暮れ時に歩いた動画です。落ち葉が美しい季節。",displayName:"田中 葵",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/BigBuckBunny.jpg",createdAt:null,uid:"other"},
+  {id:"d2",title:"手作りラーメン — 豚骨スープから作る本格レシピ",desc:"自家製豚骨ラーメンの作り方を丁寧に紹介します。",displayName:"料理チャンネル",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/ElephantsDream.jpg",createdAt:null,uid:"other"},
+  {id:"d3",title:"ギター練習 — 初心者向けコードF完全攻略",desc:"Fコードが押さえられない方必見！",displayName:"Guitar Life",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/ForBiggerBlazes.jpg",createdAt:null,uid:"other"},
+  {id:"d4",title:"東京 夜景タイムラプス 4K",desc:"東京タワー周辺の夜景を長時間撮影しました。",displayName:"Tokyo Lens",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/ForBiggerEscapes.jpg",createdAt:null,uid:"other"},
+  {id:"d5",title:"Python入門 #1 — 変数とデータ型",desc:"プログラミング初心者向けPython基礎講座第1回。",displayName:"CodeMaster JP",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/SubaruOutbackOnStreetAndDirt.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/SubaruOutbackOnStreetAndDirt.jpg",createdAt:null,uid:"other"},
+  {id:"d6",title:"猫のいる日常 Vol.12 — 朝のルーティン",desc:"我が家の猫たちと過ごす朝のひとコマ。",displayName:"にゃんこ日記",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/VolkswagenGTIReview.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/VolkswagenGTIReview.jpg",createdAt:null,uid:"other"},
+  {id:"d7",title:"週末のVlog — 京都一人旅",desc:"嵐山・金閣寺・祇園を巡る1泊2日の旅。",displayName:"旅するフォトグラファー",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/BigBuckBunny.jpg",createdAt:null,uid:"other"},
+  {id:"d8",title:"自作PC組み立て 2024年版 完全ガイド",desc:"RTX 4070搭載ゲーミングPCを一から組み立てる動画。",displayName:"PC Builder",photoURL:"",
+   videoUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+   thumbUrl:"https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/images/ElephantsDream.jpg",createdAt:null,uid:"other"},
+];
+function initDemoMode(){renderGrid(demoVideos);updateAuthUI(null);}
+function addDemoVideo(d){
+  demoVideos.unshift({id:"d-"+Date.now(),...d,
+    displayName:currentUser?.displayName||"あなた",
+    photoURL:currentUser?.photoURL||"",createdAt:null,uid:currentUser?.uid||"demo"});
+  renderGrid(demoVideos);
+}
+function enterDemoUser(){
+  currentUser={uid:"demo-me",displayName:"あなた",photoURL:"",email:"demo@example.com"};
+  document.getElementById("login-modal").style.display="none";updateAuthUI(currentUser);
+}
+function exitDemoUser(){currentUser=null;updateAuthUI(null);renderGrid(demoVideos);}
+
+function fmtTime(d){
+  if(!d)return"今";
+  const diff=Date.now()-d;
+  if(diff<60000)return"今";
+  if(diff<3600000)return Math.floor(diff/60000)+"分前";
+  if(diff<86400000)return Math.floor(diff/3600000)+"時間前";
+  if(diff<2592000000)return Math.floor(diff/86400000)+"日前";
+  return d.toLocaleDateString("ja-JP",{year:"numeric",month:"short",day:"numeric"});
+}
+function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+</script>
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f0f;
+  --surf:#212121;
+  --surf2:#272727;
+  --surf3:#3f3f3f;
+  --border:#3f3f3f;
+  --text:#f1f1f1;
+  --text2:#aaaaaa;
+  --text3:#717171;
+  --red:#ff0000;
+  --red2:#cc0000;
+  --blue:#3ea6ff;
+  --font:"Roboto","Noto Sans JP",sans-serif;
+  --hdr:56px;
+  --side:240px;
+  --side-mini:72px;
+}
+html{-webkit-text-size-adjust:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+
+/* ── HEADER ── */
+#header{
+  position:fixed;top:0;left:0;right:0;height:var(--hdr);z-index:300;
+  background:var(--bg);display:flex;align-items:center;padding:0 16px;gap:8px;
+}
+.hdr-left{display:flex;align-items:center;gap:8px;width:var(--side);flex-shrink:0}
+.menu-btn{
+  width:40px;height:40px;border-radius:50%;background:none;border:none;
+  color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:background .15s;flex-shrink:0;
+}
+.menu-btn:hover{background:rgba(255,255,255,.1)}
+.menu-btn svg{width:24px;height:24px}
+.yt-logo{
+  display:flex;align-items:center;gap:2px;text-decoration:none;cursor:pointer;
+  height:20px;flex-shrink:0;
+}
+.yt-logo-icon{display:flex;align-items:center}
+.yt-logo-icon svg{height:20px;width:auto}
+.yt-logo-text{font-family:"Roboto",sans-serif;font-size:20px;font-weight:700;letter-spacing:-.5px;color:var(--text);margin-left:4px;line-height:1}
+.yt-logo-text sup{font-size:10px;font-weight:400;color:var(--text2);margin-left:1px;vertical-align:super}
+
+.hdr-center{flex:1;max-width:680px;margin:0 auto;display:flex;align-items:center;gap:10px}
+#search-form{display:flex;flex:1;border-radius:40px;overflow:hidden;border:1px solid var(--surf3);height:40px;transition:border-color .15s}
+#search-form:focus-within{border-color:#1c62b9}
+#search-input{
+  flex:1;background:var(--surf);border:none;color:var(--text);
+  font-family:var(--font);font-size:16px;padding:0 16px;outline:none;
+  border-radius:40px 0 0 40px;
+}
+#search-input::placeholder{color:var(--text3)}
+.search-submit{
+  width:64px;background:var(--surf2);border:none;border-left:1px solid var(--surf3);
+  color:var(--text2);cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:background .15s;
+}
+.search-submit:hover{background:var(--surf3)}
+.search-submit svg{width:22px;height:22px}
+.mic-btn{
+  width:40px;height:40px;border-radius:50%;background:var(--surf2);border:none;
+  color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:background .15s;flex-shrink:0;
+}
+.mic-btn:hover{background:var(--surf3)}
+.mic-btn svg{width:22px;height:22px}
+
+.hdr-right{display:flex;align-items:center;gap:4px;margin-left:auto;flex-shrink:0}
+.hdr-icon-btn{
+  width:40px;height:40px;border-radius:50%;background:none;border:none;
+  color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:background .15s;position:relative;
+}
+.hdr-icon-btn:hover{background:rgba(255,255,255,.1)}
+.hdr-icon-btn svg{width:24px;height:24px}
+#upload-btn-wrap{display:none}
+.sign-in-btn{
+  display:flex;align-items:center;gap:8px;
+  border:1px solid var(--blue);color:var(--blue);
+  background:rgba(62,166,255,.1);
+  border-radius:20px;padding:6px 14px;
+  font-size:14px;font-weight:500;font-family:var(--font);
+  cursor:pointer;transition:background .15s;white-space:nowrap;
+}
+.sign-in-btn:hover{background:rgba(62,166,255,.2)}
+.sign-in-btn svg{width:20px;height:20px}
+#auth-out{display:flex}
+#auth-in{display:none;align-items:center;gap:4px}
+.hdr-av-img{width:32px;height:32px;border-radius:50%;object-fit:cover;cursor:pointer}
+.hdr-av-init{
+  width:32px;height:32px;border-radius:50%;background:var(--red);
+  display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:14px;color:white;cursor:pointer;
+}
+.logout-pill{
+  background:none;border:1px solid var(--border);color:var(--text2);
+  border-radius:20px;padding:5px 12px;font-size:13px;font-family:var(--font);
+  cursor:pointer;transition:background .15s;
+}
+.logout-pill:hover{background:var(--surf2)}
+
+/* ── SIDEBAR ── */
+#sidebar{
+  position:fixed;top:var(--hdr);left:0;bottom:0;width:var(--side);
+  background:var(--bg);overflow-y:auto;overflow-x:hidden;z-index:200;
+  padding:12px 0;transition:width .2s ease;
+}
+#sidebar::-webkit-scrollbar{width:0}
+#sidebar.collapsed{width:var(--side-mini)}
+.nav-section{margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--surf2)}
+.nav-section:last-child{border-bottom:none}
+.nav-item{
+  display:flex;align-items:center;gap:20px;
+  padding:0 14px;height:40px;border-radius:10px;margin:0 6px;
+  cursor:pointer;transition:background .15s;text-decoration:none;color:var(--text);
+  white-space:nowrap;
+}
+.nav-item:hover{background:rgba(255,255,255,.1)}
+.nav-item.active{background:rgba(255,255,255,.12)}
+.nav-item.active .nav-icon svg{opacity:1}
+.nav-icon{width:24px;height:24px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.nav-icon svg{width:24px;height:24px;opacity:.85}
+.nav-label{font-size:14px;font-weight:500;overflow:hidden}
+.nav-section-title{padding:6px 20px;font-size:10px;font-weight:700;letter-spacing:1px;color:var(--text3);text-transform:uppercase}
+#sidebar.collapsed .nav-label{display:none}
+#sidebar.collapsed .nav-section-title{display:none}
+#sidebar.collapsed .nav-item{justify-content:center;padding:0;gap:0}
+#sidebar.collapsed .nav-item span{display:none}
+
+/* ── MAIN CONTENT ── */
+#main-content{
+  margin-top:var(--hdr);margin-left:var(--side);
+  transition:margin-left .2s ease;min-height:calc(100vh - var(--hdr));
+}
+#main-content.sidebar-collapsed{margin-left:var(--side-mini)}
+
+/* ── HOME PAGE ── */
+#page-home{padding:24px 24px 40px}
+.chip-row{display:flex;gap:8px;overflow-x:auto;margin-bottom:20px;padding-bottom:4px;scrollbar-width:none}
+.chip-row::-webkit-scrollbar{display:none}
+.chip{
+  padding:7px 14px;border-radius:8px;background:rgba(255,255,255,.1);
+  font-size:14px;font-weight:500;cursor:pointer;white-space:nowrap;
+  border:none;color:var(--text);font-family:var(--font);transition:background .15s;
+}
+.chip:hover{background:rgba(255,255,255,.2)}
+.chip.active{background:var(--text);color:var(--bg)}
+#video-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+  gap:16px 16px;
+}
+
+/* skeleton */
+.grid-skel{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+.skel{} .skel-th{aspect-ratio:16/9;background:var(--surf);border-radius:10px;animation:sk 1.5s infinite}
+.skel-av-row{display:flex;gap:10px;padding:10px 2px 0;align-items:flex-start}
+.skel-av{width:36px;height:36px;border-radius:50%;background:var(--surf);flex-shrink:0;animation:sk 1.5s infinite}
+.skel-lines{flex:1;display:flex;flex-direction:column;gap:8px;padding-top:2px}
+.skel-line{height:13px;background:var(--surf);border-radius:4px;animation:sk 1.5s infinite}
+@keyframes sk{0%,100%{opacity:.4}50%{opacity:.9}}
+.empty{grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text2)}
+.empty h3{font-size:18px;font-weight:600;color:var(--text);margin-bottom:8px}
+.empty p{font-size:14px}
+
+/* yt card */
+.yt-card{cursor:default}
+.yt-thumb{position:relative;aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:var(--surf)}
+.yt-thumb img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .3s;border-radius:10px}
+.yt-thumb:hover img{border-radius:0}
+.no-thumb{width:100%;height:100%;background:linear-gradient(135deg,#1a1a1a,#2a2a2a);display:flex;align-items:center;justify-content:center;color:var(--surf3);font-size:48px}
+.yt-dur{position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.8);color:#fff;font-size:12px;font-weight:700;padding:2px 5px;border-radius:4px;display:none}
+.yt-info{display:flex;gap:10px;padding:10px 4px 0;position:relative}
+.yt-ch-av{flex-shrink:0;padding-top:2px}
+.ch-img{width:36px;height:36px;border-radius:50%;object-fit:cover;cursor:pointer}
+.ch-init{width:36px;height:36px;border-radius:50%;background:var(--red);align-items:center;justify-content:center;font-weight:700;color:white;font-size:14px;cursor:pointer}
+.yt-meta{flex:1;min-width:0}
+.yt-title{font-size:14px;font-weight:600;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:4px;cursor:pointer;color:var(--text)}
+.yt-title:hover{color:#ddd}
+.yt-ch-name{font-size:13px;color:var(--text2);margin-bottom:2px;cursor:pointer}
+.yt-ch-name:hover{color:var(--text)}
+.yt-stats{font-size:13px;color:var(--text2)}
+.yt-more-btn{
+  width:36px;height:36px;border-radius:50%;background:none;border:none;
+  color:var(--text2);cursor:pointer;display:flex;align-items:center;justify-content:center;
+  opacity:0;transition:all .15s;flex-shrink:0;padding:0;align-self:flex-start;margin-top:-2px;
+}
+.yt-card:hover .yt-more-btn{opacity:1}
+.yt-more-btn:hover{background:rgba(255,255,255,.1);color:var(--text)}
+
+/* ── UPLOAD PAGE ── */
+#page-upload{max-width:900px;margin:0 auto;padding:28px 24px 60px}
+.up-header{display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid var(--surf2)}
+.up-back{width:40px;height:40px;border-radius:50%;background:none;border:none;color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
+.up-back:hover{background:rgba(255,255,255,.1)}
+.up-back svg{width:24px;height:24px}
+.up-title{font-size:22px;font-weight:500}
+
+.up-layout{display:grid;grid-template-columns:1fr 320px;gap:24px}
+.up-left{}
+.up-right{}
+
+#dropzone{
+  border:2px dashed var(--surf3);border-radius:12px;padding:48px 24px;
+  text-align:center;cursor:pointer;transition:all .2s;margin-bottom:0;
+  background:var(--surf);
+}
+#dropzone:hover,#dropzone.dz-over{border-color:var(--blue);background:rgba(62,166,255,.04)}
+#dz-icon{font-size:56px;margin-bottom:16px;display:block}
+#dz-text{font-size:16px;color:var(--text2);line-height:1.7}
+#dz-text strong{color:var(--text);display:block;margin-bottom:4px}
+#dz-text span{font-size:13px}
+.dz-sub{font-size:13px;color:var(--text3);margin-top:6px}
+
+#upload-fields{display:none;margin-top:24px}
+.up-field{margin-bottom:20px}
+.up-label{display:block;font-size:14px;font-weight:500;color:var(--text2);margin-bottom:8px}
+.up-input{
+  width:100%;background:var(--surf);border:1px solid var(--surf3);
+  border-radius:4px;color:var(--text);font-family:var(--font);
+  font-size:14px;padding:12px 14px;outline:none;transition:border-color .15s;
+}
+.up-input:focus{border-color:var(--blue)}
+.up-input::placeholder{color:var(--text3)}
+textarea.up-input{resize:vertical;min-height:100px;line-height:1.6}
+
+.thumb-label{font-size:14px;font-weight:500;color:var(--text2);margin-bottom:10px;display:block}
+#thumb-area{
+  width:180px;aspect-ratio:16/9;border-radius:6px;border:2px dashed var(--surf3);
+  cursor:pointer;position:relative;overflow:hidden;background:var(--surf2);
+  display:flex;align-items:center;justify-content:center;transition:border-color .15s;
+}
+#thumb-area:hover{border-color:var(--blue)}
+#thumb-preview-wrap{display:none;position:absolute;inset:0}
+#thumb-preview{width:100%;height:100%;object-fit:cover}
+.thumb-hint{font-size:12px;color:var(--text3);text-align:center;padding:8px;line-height:1.6}
+
+#prog-wrap{display:none;margin-top:20px}
+.prog-label{font-size:13px;color:var(--text2);margin-bottom:8px;display:flex;justify-content:space-between}
+.prog-track{height:4px;background:var(--surf3);border-radius:2px;overflow:hidden}
+#prog-bar{height:100%;background:var(--red);border-radius:2px;width:0%;transition:width .3s}
+
+#submit-upload{
+  margin-top:24px;width:100%;padding:12px;background:var(--blue);color:var(--bg);
+  border:none;border-radius:4px;font-size:15px;font-weight:700;
+  font-family:var(--font);cursor:pointer;transition:background .15s;
+}
+#submit-upload:hover:not(:disabled){filter:brightness(1.1)}
+#submit-upload:disabled{opacity:.5;cursor:not-allowed}
+
+/* ── PLAYER PAGE ── */
+#page-player{display:none}
+.player-top{
+  display:grid;grid-template-columns:1fr 402px;gap:24px;
+  padding:20px 24px 24px;
+}
+.player-main{}
+.player-wrap{background:#000;border-radius:12px;overflow:hidden;aspect-ratio:16/9;margin-bottom:12px}
+#main-video{width:100%;height:100%;display:block}
+
+.pl-title{font-size:20px;font-weight:600;line-height:1.3;margin-bottom:14px;padding-right:8px}
+.pl-actions-row{
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
+  padding:12px 0;border-top:1px solid var(--surf2);border-bottom:1px solid var(--surf2);margin-bottom:16px;
+}
+.pl-ch-row{display:flex;align-items:center;gap:12px}
+.pl-ch-img{width:40px;height:40px;border-radius:50%;object-fit:cover;cursor:pointer}
+.pl-ch-init{width:40px;height:40px;border-radius:50%;background:var(--red);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:white}
+.pl-ch-info{}
+.pl-ch-name{font-size:15px;font-weight:600;cursor:pointer}
+.pl-ch-name:hover{color:var(--text2)}
+.pl-time{font-size:13px;color:var(--text2)}
+
+.pl-btns{display:flex;gap:8px;flex-wrap:wrap}
+.yt-pill{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--surf2);border:none;color:var(--text);
+  padding:8px 14px;border-radius:20px;font-size:14px;font-weight:500;
+  font-family:var(--font);cursor:pointer;transition:background .15s;
+  border:1px solid transparent;
+}
+.yt-pill:hover{background:var(--surf3)}
+.yt-pill svg{width:20px;height:20px}
+.yt-pill.liked{background:rgba(255,255,255,.15);color:var(--text)}
+.yt-pill.danger{border-color:#f4212e;color:#f4212e;background:transparent}
+.yt-pill.danger:hover{background:rgba(244,33,46,.1)}
+
+.pl-desc-box{background:var(--surf);border-radius:12px;padding:14px;cursor:pointer}
+.pl-desc-meta{font-size:14px;font-weight:600;margin-bottom:8px;color:var(--text)}
+.pl-desc-text{font-size:14px;color:var(--text2);line-height:1.7;white-space:pre-wrap;word-break:break-word}
+
+/* related */
+.rel-title-hd{font-size:15px;font-weight:600;margin-bottom:14px;color:var(--text)}
+.rel-item{display:flex;gap:8px;margin-bottom:8px;cursor:pointer;border-radius:10px;padding:4px;transition:background .15s}
+.rel-item:hover{background:var(--surf2)}
+.rel-thumb{width:168px;height:94px;border-radius:8px;overflow:hidden;flex-shrink:0;background:var(--surf)}
+.rel-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.rel-meta{flex:1;min-width:0;padding-top:2px}
+.rel-title{font-size:13px;font-weight:600;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:4px}
+.rel-ch{font-size:12px;color:var(--text2);margin-bottom:2px}
+.rel-time{font-size:12px;color:var(--text2)}
+
+/* ── CONTEXT MENU ── */
+.ctx-menu{
+  background:var(--surf2);border:1px solid var(--surf3);border-radius:10px;
+  overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.7);min-width:200px;
+}
+.ctx-item{
+  display:flex;align-items:center;gap:14px;width:100%;padding:12px 16px;
+  background:none;border:none;color:var(--text);font-family:var(--font);
+  font-size:14px;text-align:left;cursor:pointer;transition:background .15s;
+}
+.ctx-item:hover{background:rgba(255,255,255,.1)}
+.ctx-delete{color:#f4212e}
+.ctx-delete:hover{background:rgba(244,33,46,.1)}
+
+/* ── LOGIN MODAL ── */
+#login-modal{
+  display:none;position:fixed;inset:0;z-index:1000;
+  background:rgba(0,0,0,.8);align-items:center;justify-content:center;padding:16px;
+}
+.login-box{
+  background:#282828;border-radius:12px;padding:40px 36px;
+  width:100%;max-width:400px;text-align:center;position:relative;
+  box-shadow:0 24px 48px rgba(0,0,0,.9);
+}
+.login-logo{margin-bottom:24px;display:flex;align-items:center;justify-content:center;gap:6px}
+.login-logo-icon svg{height:32px;width:auto}
+.login-logo-text{font-size:26px;font-weight:700;letter-spacing:-.5px}
+.login-logo-text sup{font-size:12px;font-weight:400;color:var(--text2)}
+.login-sub{font-size:15px;color:var(--text2);margin-bottom:28px;line-height:1.6}
+.g-btn{
+  display:flex;align-items:center;justify-content:center;gap:12px;
+  width:100%;padding:12px;background:white;color:#333;
+  border:none;border-radius:4px;font-size:15px;font-weight:500;
+  font-family:var(--font);cursor:pointer;transition:background .15s;
+  box-shadow:0 1px 3px rgba(0,0,0,.3);
+}
+.g-btn:hover{background:#f5f5f5}
+.modal-x{
+  position:absolute;top:12px;right:12px;background:none;border:none;
+  color:var(--text2);font-size:20px;cursor:pointer;width:32px;height:32px;
+  border-radius:50%;display:flex;align-items:center;justify-content:center;
+  transition:background .15s;
+}
+.modal-x:hover{background:var(--surf3)}
+
+/* ── TOAST ── */
+.yt-toast{
+  position:fixed;bottom:24px;left:50%;
+  transform:translateX(-50%) translateY(16px);
+  background:#3d3d3d;color:var(--text);
+  padding:12px 20px;border-radius:4px;font-size:14px;
+  opacity:0;transition:all .3s;z-index:9999;pointer-events:none;
+  white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.5);
+}
+.yt-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.yt-toast.err{background:#f4212e;color:white}
+
+/* ── DEMO BANNER ── */
+#demo-banner{
+  display:none;background:#1a1207;border-bottom:1px solid #ff0;
+  padding:7px 24px;font-size:13px;color:#999;
+  position:fixed;top:var(--hdr);left:0;right:0;z-index:250;
+  align-items:center;gap:8px;
+}
+#demo-banner a{color:#ffdd00;cursor:pointer;text-decoration:underline}
+body.has-demo-banner #header{top:34px}
+body.has-demo-banner #sidebar{top:calc(var(--hdr) + 34px)}
+body.has-demo-banner #main-content{margin-top:calc(var(--hdr) + 34px)}
+
+/* ── RESPONSIVE ── */
+@media(max-width:1280px){
+  .player-top{grid-template-columns:1fr 360px;padding:16px}
+}
+@media(max-width:1024px){
+  #sidebar{width:var(--side-mini)}
+  #sidebar .nav-label{display:none}
+  #sidebar .nav-section-title{display:none}
+  #sidebar .nav-item{justify-content:center;padding:0;gap:0}
+  #main-content{margin-left:var(--side-mini)}
+  .hdr-left{width:var(--side-mini)}
+  .player-top{grid-template-columns:1fr}
+  .rel-sidebar{display:none}
+}
+@media(max-width:768px){
+  :root{--side-mini:0px}
+  #sidebar{display:none}
+  #main-content{margin-left:0}
+  .hdr-left{width:auto}
+  .hdr-center{max-width:none}
+  .mic-btn{display:none}
+  .pl-actions-row{flex-direction:column;align-items:flex-start}
+  .up-layout{grid-template-columns:1fr}
+  .up-right{display:none}
+  #page-home{padding:16px 12px}
+  #video-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+  .yt-title{font-size:13px}
+  .yt-ch-name,.yt-stats{font-size:11px}
+  .ch-img,.ch-init{width:30px;height:30px;font-size:12px}
+  .yt-more-btn{opacity:1}
+}
+@media(max-width:480px){
+  #video-grid{grid-template-columns:1fr 1fr}
+  .yt-info{gap:6px}
+}
+::-webkit-scrollbar{width:8px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:#3f3f3f;border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:#555}
+</style>
+</head>
+<body>
+
+<div id="demo-banner">
+  ⚙️ デモモード —
+  <a onclick="document.getElementById('firebase-info').style.display='block'">Firebaseを設定</a>すると動画アップロードが使えます
+  &nbsp;|&nbsp;
+  <a onclick="handleLogin()">ログイン（デモ）</a>
+</div>
+<div id="firebase-info" style="display:none;position:fixed;top:90px;left:50%;transform:translateX(-50%);background:#282828;border:1px solid var(--border);border-radius:10px;padding:16px 20px;font-size:13px;color:#aaa;z-index:9999;max-width:500px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.8)">
+  <strong style="color:white;display:block;margin-bottom:8px">Firebase設定方法</strong>
+  HTMLのfirebaseConfigをあなたのプロジェクト情報に変更してください。<br>
+  <a href="https://console.firebase.google.com" target="_blank" style="color:#ffdd00">Firebase Console →</a>
+  <button onclick="this.parentElement.style.display='none'" style="background:none;border:none;color:#aaa;cursor:pointer;float:right;font-size:18px;margin-top:-4px">✕</button>
+</div>
+
+<!-- HEADER -->
+<div id="header">
+  <div class="hdr-left">
+    <button class="menu-btn" onclick="toggleSidebar()">
+      <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+    </button>
+    <div class="yt-logo" onclick="goHome()">
+      <div class="yt-logo-icon">
+        <svg viewBox="0 0 90 20" height="20" xmlns="http://www.w3.org/2000/svg">
+          <rect width="32" height="20" rx="5" fill="#ff0000"/>
+          <polygon points="13,5 13,15 22,10" fill="white"/>
+          <text x="38" y="15" font-family="Roboto,sans-serif" font-weight="700" font-size="16" fill="white" letter-spacing="-0.5">ViewTube</text>
+        </svg>
+      </div>
+      <sup style="font-size:9px;color:var(--text3);margin-left:2px;margin-top:2px">JP</sup>
+    </div>
+  </div>
+
+  <div class="hdr-center">
+    <form id="search-form">
+      <input id="search-input" type="text" placeholder="検索" autocomplete="off">
+      <button type="submit" class="search-submit" aria-label="検索">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      </button>
+    </form>
+    <button class="mic-btn" aria-label="音声検索">
+      <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+    </button>
+  </div>
+
+  <div class="hdr-right">
+    <div id="upload-btn-wrap">
+      <button class="hdr-icon-btn" onclick="openUpload()" title="動画を投稿">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4zM14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2z"/></svg>
+      </button>
+    </div>
+    <button class="hdr-icon-btn" title="通知">
+      <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
+    </button>
+    <div id="auth-out">
+      <button class="sign-in-btn" onclick="handleLogin()">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
+        ログイン
+      </button>
+    </div>
+    <div id="auth-in">
+      <div id="hdr-avatar"></div>
+      <button class="logout-pill" onclick="handleLogout()">ログアウト</button>
+    </div>
+  </div>
+</div>
+
+<!-- SIDEBAR -->
+<nav id="sidebar">
+  <div class="nav-section">
+    <a class="nav-item active" id="nav-home" onclick="goHome()">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></span>
+      <span class="nav-label">ホーム</span>
+    </a>
+    <a class="nav-item" onclick="">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M21.58 7.19c-.23-.86-.91-1.54-1.77-1.77C18.25 5 12 5 12 5s-6.25 0-7.81.42c-.86.23-1.54.91-1.77 1.77C2 8.75 2 12 2 12s0 3.25.42 4.81c.23.86.91 1.54 1.77 1.77C5.75 19 12 19 12 19s6.25 0 7.81-.42c.86-.23 1.54-.91 1.77-1.77C22 15.25 22 12 22 12s0-3.25-.42-4.81zM10 15V9l5.2 3-5.2 3z"/></svg></span>
+      <span class="nav-label">Shorts</span>
+    </a>
+    <a class="nav-item" onclick="">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg></span>
+      <span class="nav-label">登録チャンネル</span>
+    </a>
+  </div>
+  <div class="nav-section">
+    <div class="nav-section-title">あなたのチャンネル</div>
+    <a class="nav-item" id="nav-upload" onclick="openUpload()">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4zM14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2z"/></svg></span>
+      <span class="nav-label">動画を投稿</span>
+    </a>
+    <a class="nav-item" onclick="">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 16V4c0-1.1-.9-2-2-2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2zm-11-4l2.03 2.71L16 11l4 5H8l3-4zM2 6v14c0 1.1.9 2 2 2h14v-2H4V6H2z"/></svg></span>
+      <span class="nav-label">メディア</span>
+    </a>
+  </div>
+  <div class="nav-section">
+    <div class="nav-section-title">探す</div>
+    <a class="nav-item" onclick="">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg></span>
+      <span class="nav-label">音楽</span>
+    </a>
+    <a class="nav-item" onclick="">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M21 6H3c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-10 7H8v3H6v-3H3v-2h3V8h2v3h3v2zm4.5 2c-.83 0-1.5-.67-1.5-1.5v-5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5v5c0 .83-.67 1.5-1.5 1.5zm4-2c-.83 0-1.5-.67-1.5-1.5S18.67 10 19.5 10s1.5.67 1.5 1.5S20.33 13 19.5 13z"/></svg></span>
+      <span class="nav-label">ゲーム</span>
+    </a>
+    <a class="nav-item" onclick="">
+      <span class="nav-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.5 12c0 1.44-.44 2.78-1.19 3.89L10.62 10.2C11.73 9.44 13.06 9 14.5 9c1.66 0 3.16.67 4.24 1.76C18.35 11.17 17.5 11.58 17.5 12zM5.62 6.09c.7-.4 1.46-.7 2.27-.87L6.4 3.64C5.46 3.89 4.57 4.29 3.78 4.82L5.62 6.09zM3.27 4.27L2 5.54l4 4 1.27-1.27L3.27 4.27zM14.5 2C8.81 2 4.15 6.16 3.5 11.5h2.01C6.14 7.27 9.97 4 14.5 4c2.48 0 4.73 1.01 6.34 2.64l1.42-1.42C20.35 3.27 17.58 2 14.5 2zm0 4c-2.49 0-4.7 1.03-6.32 2.68l1.42 1.42C10.76 8.79 12.54 8 14.5 8c1.95 0 3.73.79 5.01 2.06l1.41-1.41C19.26 7.04 17.01 6 14.5 6zm1 9.8V22h-2v-6.2c-1.89-.49-3.29-2.2-3.29-4.3 0-.08.01-.15.01-.22L6.5 8.48C6.18 9.26 6 10.12 6 11c0 4.42 3.58 8 8.5 8 .37 0 .74-.03 1.1-.08z"/></svg></span>
+      <span class="nav-label">スポーツ</span>
+    </a>
+  </div>
+</nav>
+
+<!-- MAIN CONTENT -->
+<div id="main-content">
+
+  <!-- HOME -->
+  <div id="page-home" class="page">
+    <div class="chip-row">
+      <button class="chip active">すべて</button>
+      <button class="chip">音楽</button>
+      <button class="chip">ゲーム</button>
+      <button class="chip">ライブ</button>
+      <button class="chip">テクノロジー</button>
+      <button class="chip">スポーツ</button>
+      <button class="chip">料理</button>
+      <button class="chip">旅行</button>
+      <button class="chip">ニュース</button>
+      <button class="chip">Vlog</button>
+    </div>
+    <div id="video-grid"></div>
+  </div>
+
+  <!-- UPLOAD -->
+  <div id="page-upload" class="page" style="display:none">
+    <div class="up-header">
+      <button class="up-back" onclick="goHome()">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+      </button>
+      <span class="up-title">動画を投稿</span>
+    </div>
+    <div class="up-layout">
+      <div class="up-left">
+        <div id="dropzone">
+          <span id="dz-icon">📁</span>
+          <div id="dz-text">動画をドラッグ＆ドロップ<span>またはクリックして選択</span></div>
+          <div class="dz-sub">MP4 · MOV · WebM · AVI などに対応</div>
+        </div>
+        <input type="file" id="file-input" accept="video/*" style="display:none">
+        <div id="upload-fields">
+          <div class="up-field">
+            <label class="up-label">タイトル（必須）</label>
+            <input class="up-input" id="up-title" type="text" placeholder="視聴者の興味を引くタイトルを入力してください">
+          </div>
+          <div class="up-field">
+            <label class="up-label">説明</label>
+            <textarea class="up-input" id="up-desc" placeholder="視聴者に動画の内容を説明しましょう"></textarea>
+          </div>
+          <div class="up-field">
+            <label class="thumb-label">サムネイル</label>
+            <div id="thumb-area">
+              <div id="thumb-preview-wrap"><img id="thumb-preview" src="" alt=""></div>
+              <div class="thumb-hint">🖼<br>クリックで変更</div>
+            </div>
+            <input type="file" id="thumb-input" accept="image/*" style="display:none">
+          </div>
+          <div id="prog-wrap">
+            <div class="prog-label"><span>アップロード中...</span><span id="prog-pct">0%</span></div>
+            <div class="prog-track"><div id="prog-bar"></div></div>
+          </div>
+          <button id="submit-upload">投稿する</button>
+        </div>
+      </div>
+      <div class="up-right">
+        <div style="background:var(--surf);border-radius:10px;padding:16px">
+          <div style="font-size:13px;color:var(--text2);margin-bottom:8px;font-weight:500">投稿のヒント</div>
+          <ul style="font-size:13px;color:var(--text2);line-height:2;padding-left:16px">
+            <li>タイトルは60文字以内が効果的</li>
+            <li>説明欄にキーワードを含める</li>
+            <li>サムネイルは自動生成されます</li>
+            <li>MP4形式を推奨します</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PLAYER -->
+  <div id="page-player" class="page" style="display:none">
+    <div class="player-top">
+      <div class="player-main">
+        <div class="player-wrap">
+          <video id="main-video" controls playsinline preload="metadata"></video>
+        </div>
+        <h1 class="pl-title" id="pl-title"></h1>
+        <div class="pl-actions-row">
+          <div class="pl-ch-row">
+            <div id="pl-ch-av"></div>
+            <div class="pl-ch-info">
+              <div class="pl-ch-name" id="pl-ch-name"></div>
+              <div class="pl-time" id="pl-time"></div>
+            </div>
+          </div>
+          <div class="pl-btns">
+            <button class="yt-pill" id="pl-like">
+              <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z"/></svg>
+              <span id="pl-like-cnt"></span>
+            </button>
+            <button class="yt-pill">
+              <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M23 1l-4.5 4.5L16 3 12 7l-4-4-8 8 1.5 1.5L8 5l4 4 4-4 2.5 2.5L23 3l1 1V1h-1zM1 23l4.5-4.5L8 21l4-4 4 4 8-8-1.5-1.5L16 19l-4-4-4 4-2.5-2.5L1 21 0 20v3h1z"/></svg>
+              共有
+            </button>
+            <button class="yt-pill">
+              <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z"/></svg>
+              保存
+            </button>
+            <button class="yt-pill danger" id="pl-delete" style="display:none">
+              <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+              削除
+            </button>
+          </div>
+        </div>
+        <div class="pl-desc-box" id="pl-desc-box" onclick="this.style.maxHeight='none'">
+          <div class="pl-desc-meta">概要</div>
+          <div class="pl-desc-text" id="pl-desc"></div>
+        </div>
+      </div>
+      <aside class="rel-sidebar">
+        <div class="rel-title-hd">次の動画</div>
+        <div id="related-list"></div>
+      </aside>
+    </div>
+  </div>
+
+</div><!-- /main-content -->
+
+<!-- LOGIN MODAL -->
+<div id="login-modal">
+  <div class="login-box">
+    <button class="modal-x" onclick="closeLoginModal()">✕</button>
+    <div class="login-logo">
+      <div class="login-logo-icon">
+        <svg viewBox="0 0 24 24" height="32"><rect width="24" height="17" rx="5" fill="#ff0000" y="3.5"/><polygon points="10,7 10,16.5 18,11.75" fill="white"/></svg>
+      </div>
+      <span class="login-logo-text">ViewTube<sup>JP</sup></span>
+    </div>
+    <p class="login-sub">動画を投稿するにはGoogleアカウントでログインしてください</p>
+    <button class="g-btn" onclick="handleLogin()">
+      <svg width="18" height="18" viewBox="0 0 48 48">
+        <path fill="#4285F4" d="M45.12 24.5c0-1.56-.14-3.06-.4-4.5H24v8.51h11.84c-.51 2.75-2.06 5.08-4.39 6.64v5.52h7.11c4.16-3.83 6.56-9.47 6.56-16.17z"/>
+        <path fill="#34A853" d="M24 46c5.94 0 10.92-1.97 14.56-5.33l-7.11-5.52c-1.97 1.32-4.49 2.1-7.45 2.1-5.73 0-10.58-3.87-12.32-9.07H4.34v5.7C7.96 41.07 15.4 46 24 46z"/>
+        <path fill="#FBBC05" d="M11.68 28.18A13.63 13.63 0 0 1 11 24c0-1.45.25-2.86.68-4.18v-5.7H4.34A23.93 23.93 0 0 0 0 24c0 3.87.93 7.53 2.58 10.77l7.1-5.59z"/>
+        <path fill="#EA4335" d="M24 9.75c3.23 0 6.13 1.11 8.41 3.29l6.31-6.31C34.91 3.19 29.93 1 24 1 15.4 1 7.96 5.93 4.34 13.23l7.34 5.7C13.42 13.62 18.27 9.75 24 9.75z"/>
+      </svg>
+      Googleでログイン
+    </button>
+  </div>
+</div>
+
+<script>
+// chip filtering
+document.querySelectorAll(".chip").forEach(c=>{
+  c.addEventListener("click",function(){
+    document.querySelectorAll(".chip").forEach(x=>x.classList.remove("active"));
+    this.classList.add("active");
+  });
+});
+// demo banner body class
+if(document.getElementById("demo-banner").style.display==="flex"||
+   document.getElementById("demo-banner").style.display===""){
+  // set after module runs
+  setTimeout(()=>{
+    const b=document.getElementById("demo-banner");
+    if(b.style.display==="flex")document.body.classList.add("has-demo-banner");
+  },100);
+}
+</script>
+</body>
+</html>
