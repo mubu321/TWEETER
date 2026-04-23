@@ -18,7 +18,6 @@ import { getStorage, ref, uploadBytesResumable, getDownloadURL, deleteObject }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
 
 
-// ========== FIREBASE CONFIG ==========
 const firebaseConfig = {
   apiKey: "AIzaSyA-AfoXK81MnOxSxglADrwXRrAWqBBP0Ag",
   authDomain: "ginga-f17c1.firebaseapp.com",
@@ -26,8 +25,8 @@ const firebaseConfig = {
   storageBucket: "ginga-f17c1.firebasestorage.app",
   messagingSenderId: "676700405698",
   appId: "1:676700405698:web:1d89870e1c9cacbb9b205b",
+  measurementId: "G-48RKK47G6Q"
 };
-// =====================================
 
 
 let currentUser=null, auth, db, storage;
